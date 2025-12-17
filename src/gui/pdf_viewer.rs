@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::collections::HashMap;
 use std::process::Command;
 use std::io::Read;
+use std::fs;
 use egui::{Context, Ui, Vec2, RichText, Color32, TextureHandle};
 use lopdf::Document;
 use image::{ImageBuffer, Rgba, DynamicImage};
@@ -43,14 +44,17 @@ struct OutlineItem {
 
 impl PdfViewer {
     pub fn new() -> Self {
-        // Check if pdftoppm is available
-        let use_poppler = Command::new("pdftoppm")
+        // Check if pdftocairo or pdftoppm is available
+        let use_poppler = Command::new("pdftocairo")
+            .arg("-v")
+            .output()
+            .is_ok() || Command::new("pdftoppm")
             .arg("-v")
             .output()
             .is_ok();
         
         if !use_poppler {
-            eprintln!("Warning: pdftoppm not found. PDF rendering will be limited to text-only.");
+            eprintln!("Warning: poppler utilities not found. PDF rendering will be limited to text-only.");
             eprintln!("Install poppler-utils for full PDF rendering: sudo pacman -S poppler");
         }
         
@@ -209,10 +213,23 @@ impl PdfViewer {
         
         // Render in background thread
         std::thread::spawn(move || {
-            // Use pdftoppm to render the page
-            let dpi = 150; // Good quality
-            let output = Command::new("pdftoppm")
+            // Use pdftocairo for better PNG output (faster and more reliable)
+            // Lower DPI for faster rendering (can be increased for better quality)
+            let dpi = 120; // Balanced quality/speed
+            let temp_dir = std::env::temp_dir();
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            
+            // pdftocairo with -singlefile expects base name without extension, adds .png
+            let temp_base = temp_dir.join(format!("pdfscan_page_{}_{}", page_num_clone, timestamp));
+            let temp_file_png = temp_base.with_extension("png");
+            
+            // Try pdftocairo first (better for PNG)
+            let result = Command::new("pdftocairo")
                 .arg("-png")
+                .arg("-singlefile")
                 .arg("-r")
                 .arg(dpi.to_string())
                 .arg("-f")
@@ -220,36 +237,138 @@ impl PdfViewer {
                 .arg("-l")
                 .arg((page_num_clone + 1).to_string())
                 .arg(&pdf_path)
-                .arg("-")
+                .arg(&temp_base)  // Base name without extension
                 .output();
             
-            match output {
+            let success = match result {
                 Ok(output) if output.status.success() => {
-                    // Parse PNG from stdout
-                    match image::load_from_memory(&output.stdout) {
-                        Ok(img) => {
-                            let rgba = img.to_rgba8();
-                            let width = rgba.width();
-                            let height = rgba.height();
-                            let pixels = rgba.into_raw();
-                            
-                            // Store rendered image for main thread to load as texture
-                            let mut rendered = rendered_images_clone.lock().unwrap();
-                            rendered.insert(page_num_clone, (pixels, (width, height)));
-                            
-                            // Request repaint to load texture
-                            ctx_clone.request_repaint();
+                    // pdftocairo creates file with .png extension
+                    match fs::read(&temp_file_png) {
+                        Ok(png_data) if !png_data.is_empty() => {
+                            match image::load_from_memory(&png_data) {
+                                Ok(img) => {
+                                    let rgba = img.to_rgba8();
+                                    let width = rgba.width();
+                                    let height = rgba.height();
+                                    let pixels = rgba.into_raw();
+                                    
+                                    eprintln!("Successfully rendered page {} with pdftocairo: {}x{} pixels", 
+                                        page_num_clone, width, height);
+                                    
+                                    // Store rendered image for main thread to load as texture
+                                    let mut rendered = rendered_images_clone.lock().unwrap();
+                                    rendered.insert(page_num_clone, (pixels, (width, height)));
+                                    
+                                    // Request repaint to load texture
+                                    ctx_clone.request_repaint();
+                                    
+                                    // Clean up temp file
+                                    let _ = fs::remove_file(&temp_file_png);
+                                    true
+                                },
+                                Err(e) => {
+                                    eprintln!("Failed to parse PNG: {}", e);
+                                    false
+                                }
+                            }
+                        },
+                        Ok(_) => {
+                            eprintln!("PNG file is empty");
+                            false
                         },
                         Err(e) => {
-                            eprintln!("Failed to parse PNG from pdftoppm: {}", e);
+                            eprintln!("Failed to read temp PNG file {:?}: {}", temp_file_png, e);
+                            false
                         }
                     }
                 },
                 Ok(output) => {
-                    eprintln!("pdftoppm failed: {}", String::from_utf8_lossy(&output.stderr));
+                    // pdftocairo failed, try pdftoppm as fallback
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    eprintln!("pdftocairo failed: {}", stderr);
+                    false
                 },
                 Err(e) => {
-                    eprintln!("Failed to run pdftoppm: {}", e);
+                    // pdftocairo not available, try pdftoppm
+                    eprintln!("pdftocairo command failed: {}", e);
+                    false
+                }
+            };
+            
+            // Fallback to pdftoppm if pdftocairo failed
+            if !success {
+                // pdftoppm needs a base name (without extension) and adds page numbers like "base-1.png"
+                let temp_base_ppm = temp_dir.join(format!("pdfscan_ppm_{}_{}", page_num_clone, timestamp));
+                
+                let output = Command::new("pdftoppm")
+                    .arg("-png")
+                    .arg("-r")
+                    .arg(dpi.to_string())
+                    .arg("-f")
+                    .arg((page_num_clone + 1).to_string())
+                    .arg("-l")
+                    .arg((page_num_clone + 1).to_string())
+                    .arg(&pdf_path)
+                    .arg(&temp_base_ppm)  // Base name, pdftoppm will add "-1.png"
+                    .output();
+                
+                match output {
+                    Ok(output) if output.status.success() => {
+                        // pdftoppm outputs files like "base-1.png", "base-2.png", etc.
+                        let actual_file = temp_base_ppm.parent().unwrap()
+                            .join(format!("{}-{}.png", 
+                                temp_base_ppm.file_name().unwrap().to_string_lossy(),
+                                page_num_clone + 1));
+                        
+                        eprintln!("Looking for pdftoppm output file: {:?}", actual_file);
+                        
+                        match fs::read(&actual_file) {
+                            Ok(png_data) if !png_data.is_empty() => {
+                                match image::load_from_memory(&png_data) {
+                                    Ok(img) => {
+                                        let rgba = img.to_rgba8();
+                                        let width = rgba.width();
+                                        let height = rgba.height();
+                                        let pixels = rgba.into_raw();
+                                        
+                                        eprintln!("Successfully rendered page {} with pdftoppm: {}x{} pixels", 
+                                            page_num_clone, width, height);
+                                        
+                                        let mut rendered = rendered_images_clone.lock().unwrap();
+                                        rendered.insert(page_num_clone, (pixels, (width, height)));
+                                        ctx_clone.request_repaint();
+                                        
+                                        // Clean up temp file
+                                        let _ = fs::remove_file(&actual_file);
+                                    },
+                                    Err(e) => {
+                                        eprintln!("Failed to parse PNG from pdftoppm: {}", e);
+                                    }
+                                }
+                            },
+                            Ok(_) => {
+                                eprintln!("pdftoppm output file is empty: {:?}", actual_file);
+                            },
+                            Err(e) => {
+                                eprintln!("Failed to read pdftoppm output file {:?}: {}", actual_file, e);
+                                // List what files actually exist
+                                if let Ok(entries) = fs::read_dir(temp_base_ppm.parent().unwrap()) {
+                                    eprintln!("Files in temp dir:");
+                                    for entry in entries.flatten() {
+                                        if entry.path().to_string_lossy().contains("pdfscan") {
+                                            eprintln!("  {:?}", entry.path());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    Ok(output) => {
+                        eprintln!("pdftoppm failed: {}", String::from_utf8_lossy(&output.stderr));
+                    },
+                    Err(e) => {
+                        eprintln!("Failed to run pdftoppm: {}", e);
+                    }
                 }
             }
             
@@ -270,6 +389,14 @@ impl PdfViewer {
         
         for (page_num, pixels, (width, height)) in to_load {
             let size = [width as usize, height as usize];
+            eprintln!("Loading texture for page {}: {}x{} pixels, {} bytes", page_num, width, height, pixels.len());
+            
+            if pixels.len() != (width as usize * height as usize * 4) {
+                eprintln!("ERROR: Pixel data size mismatch! Expected {} bytes, got {}", 
+                    width as usize * height as usize * 4, pixels.len());
+                continue;
+            }
+            
             let color_image = egui::ColorImage::from_rgba_unmultiplied(size, &pixels);
             let texture = ctx.load_texture(
                 format!("pdf_page_{}", page_num),
@@ -277,6 +404,7 @@ impl PdfViewer {
                 egui::TextureOptions::default()
             );
             self.page_textures.insert(page_num, texture);
+            eprintln!("Texture loaded successfully for page {}", page_num);
             
             // Also update page data with size
             if let Some(page_data) = self.pages.get_mut(&page_num) {
@@ -517,79 +645,95 @@ impl PdfViewer {
                     }
                 }
                 
-                // Display the PDF content
+                // Ensure we have text for current page
+                if !self.pages.contains_key(&self.current_page) {
+                    self.extract_page_text(self.current_page);
+                }
+                
+                // Display the PDF content with side-by-side layout
                 egui::CentralPanel::default().show_inside(ui, |ui| {
-                    egui::ScrollArea::both()
-                        .auto_shrink([false; 2])
-                        .id_source("pdf_content")
-                        .show(ui, |ui| {
-                            // Try to show rendered page first
-                            if let Some(texture) = self.page_textures.get(&self.current_page) {
-                                // Show rendered page image
-                                let size = texture.size_vec2() * self.zoom;
-                                
-                                ui.vertical_centered(|ui| {
-                                    let image = egui::Image::new(texture)
-                                        .fit_to_exact_size(size);
-                                    ui.add(image);
-                                });
-                                
-                                // Show text panel if requested
-                                if self.show_text_panel {
-                                    ui.separator();
-                                    if let Some(page_data) = self.pages.get(&self.current_page) {
-                                        egui::ScrollArea::vertical()
-                                            .max_height(200.0)
-                                            .show(ui, |ui| {
-                                                ui.label(&page_data.text);
+                    ui.horizontal(|ui| {
+                        // Left side: Rendered page (or placeholder)
+                        ui.vertical(|ui| {
+                            let available_width = ui.available_width();
+                            ui.set_width(available_width * 0.65); // 65% for image
+                            
+                            egui::ScrollArea::both()
+                                .auto_shrink([false; 2])
+                                .id_source("pdf_image")
+                                .show(ui, |ui| {
+                                    // Try to show rendered page first
+                                    if let Some(texture) = self.page_textures.get(&self.current_page) {
+                                        // Show rendered page image
+                                        let texture_size = texture.size_vec2();
+                                        eprintln!("Displaying texture for page {}: {:?}, zoom: {}", 
+                                            self.current_page, texture_size, self.zoom);
+                                        
+                                        if texture_size.x > 0.0 && texture_size.y > 0.0 {
+                                            let size = texture_size * self.zoom;
+                                            
+                                            ui.vertical_centered(|ui| {
+                                                let image = egui::Image::new(texture)
+                                                    .fit_to_exact_size(size);
+                                                ui.add(image);
                                             });
-                                    }
-                                }
-                            } else if let Some(page_data) = self.pages.get(&self.current_page) {
-                                // Fallback to text display
-                                let text_height = page_data.text.lines().count() as f32 * 18.0;
-                                let content_rect = egui::Rect::from_min_size(
-                                    ui.cursor().min,
-                                    Vec2::new(
-                                        page_data.size.x, 
-                                        text_height.max(page_data.size.y)
-                                    )
-                                );
-                                
-                                // Create a "page" with white background
-                                ui.painter().rect_filled(content_rect, 4.0, Color32::WHITE);
-                                ui.painter().rect_stroke(content_rect, 4.0, egui::Stroke::new(1.0, Color32::GRAY));
-                                ui.allocate_rect(content_rect, egui::Sense::hover());
-                                
-                                let text_rect = content_rect.shrink(20.0);
-                                
-                                if !page_data.text.is_empty() {
-                                    // Show text with better formatting
-                                    egui::ScrollArea::vertical()
-                                        .max_height(content_rect.height())
-                                        .show(ui, |ui| {
-                                            ui.label(&page_data.text);
-                                        });
-                                } else {
-                                    ui.put(text_rect, egui::Label::new("No text content available"));
-                                }
-                            } else {
-                                // Loading state
-                                let rendering = self.rendering_pages.lock().unwrap();
-                                let is_rendering = rendering.contains(&self.current_page);
-                                drop(rendering);
-                                
-                                ui.vertical_centered(|ui| {
-                                    ui.add_space(50.0);
-                                    if is_rendering {
-                                        ui.label("Rendering page...");
+                                        } else {
+                                            ui.vertical_centered(|ui| {
+                                                ui.label("Invalid texture size");
+                                            });
+                                        }
                                     } else {
-                                        ui.label("Loading page content...");
+                                        // Show loading or placeholder
+                                        let rendering = self.rendering_pages.lock().unwrap();
+                                        let is_rendering = rendering.contains(&self.current_page);
+                                        drop(rendering);
+                                        
+                                        ui.vertical_centered(|ui| {
+                                            ui.add_space(100.0);
+                                            if is_rendering {
+                                                ui.label("Rendering page...");
+                                            } else if self.use_poppler {
+                                                ui.label("Click to render page");
+                                            } else {
+                                                ui.label("Rendering not available");
+                                            }
+                                            ui.add_space(100.0);
+                                        });
                                     }
-                                    ui.add_space(50.0);
                                 });
+                        });
+                        
+                        ui.separator();
+                        
+                        // Right side: Text content (always shown)
+                        ui.vertical(|ui| {
+                            ui.set_width(ui.available_width()); // Remaining space for text
+                            
+                            ui.heading("Text Content");
+                            ui.separator();
+                            
+                            if let Some(page_data) = self.pages.get(&self.current_page) {
+                                egui::ScrollArea::vertical()
+                                    .id_source("pdf_text")
+                                    .show(ui, |ui| {
+                                        if !page_data.text.is_empty() {
+                                            // Display text with better formatting
+                                            for line in page_data.text.lines() {
+                                                if !line.trim().is_empty() {
+                                                    ui.label(line);
+                                                } else {
+                                                    ui.add_space(5.0);
+                                                }
+                                            }
+                                        } else {
+                                            ui.label("No text content available");
+                                        }
+                                    });
+                            } else {
+                                ui.label("Loading text...");
                             }
                         });
+                    });
                 });
             } else if self.loading {
                 // Show loading indicator
@@ -668,8 +812,22 @@ impl PdfViewer {
 }
 
 /// Extract text from a PDF file using the pdf-extract library
+/// Note: May produce Unicode warnings (harmless) and can panic on malformed PDFs
 fn extract_text_from_pdf(path: &Path) -> Result<String, Box<dyn std::error::Error>> {
     let bytes = std::fs::read(path)?;
-    let text = pdf_extract::extract_text_from_mem(&bytes)?;
-    Ok(text)
+    // Suppress stderr during extraction to reduce noise from Unicode warnings
+    let text = std::panic::catch_unwind(|| {
+        pdf_extract::extract_text_from_mem(&bytes)
+    });
+    
+    match text {
+        Ok(Ok(text)) => Ok(text),
+        Ok(Err(e)) => Err(Box::new(e)),
+        Err(_) => {
+            // Panic occurred (likely from type1-encoding-parser with malformed fonts)
+            // Return empty text rather than crashing
+            eprintln!("Warning: PDF text extraction encountered an error (malformed PDF?)");
+            Ok(String::new())
+        }
+    }
 } 

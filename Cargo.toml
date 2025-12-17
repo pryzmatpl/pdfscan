@@ -14,8 +14,7 @@ indicatif = "0.17.8"
 dirs = "5.0.1"
 zip = "0.6.6"
 chrono = "0.4.35"
-lopdf = "0.31.0"  # Used for basic PDF manipulation
-pdfium-render = "0.8.30"  # High-quality PDF rendering library backed by Google's Pdfium
+lopdf = "0.31.0"  # Used for PDF text extraction and manipulation
 
 # UI dependencies
 eframe = "0.26.2"
@@ -27,6 +26,9 @@ thiserror = "1.0.58"
 env_logger = "0.11.2"
 anyhow = "1.0.80"
 egui-modal = "0.3.1"
+
+[dev-dependencies]
+tempfile = "3.10.0"
 
 [features]
 default = ["cli", "gui"]

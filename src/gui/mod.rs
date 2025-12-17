@@ -5,4 +5,5 @@ mod analysis_panel;
 mod theme;
 mod utils;
 
-pub use app::PdfScanApp; 
+pub use app::PdfScanApp;
+pub use pdf_viewer::PdfViewer; 

@@ -144,29 +144,23 @@ EOF
     echo "};"
   } > pdfium.version
   
-  # Also try to globalize symbols in object files
-  echo "Globalizing FPDF_* symbols in object files..."
-  cd pdfium_objs
-  while read sym; do
-    for obj in *.o; do
-      objcopy --globalize-symbol="$sym" "$obj" 2>/dev/null || true
-    done
-  done < ../fpdf_symbols.txt
-  cd ..
+  # Skip objcopy processing - use -Wl,--export-dynamic to export all symbols
+  # This exports everything, but ensures FPDF_* symbols are available
+  echo "Linking with --export-dynamic to export all symbols..."
   
-  # Link with version script to export FPDF_* symbols
+  # Link with --export-dynamic to force export of all symbols (including hidden ones)
   if command -v ld.gold >/dev/null 2>&1; then
     echo "Using gold linker..."
     g++ -shared -fPIC -o libpdfium.so pdfium_objs/*.o \
       -fuse-ld=gold \
-      -Wl,--version-script=pdfium.version \
+      -Wl,--export-dynamic \
       -Wl,-soname,libpdfium.so \
       -licuuc -licui18n -lfreetype -llcms2 -lopenjpeg -ljpeg -lpng -lz \
       -pthread
   else
     echo "Using default linker..."
     g++ -shared -fPIC -o libpdfium.so pdfium_objs/*.o \
-      -Wl,--version-script=pdfium.version \
+      -Wl,--export-dynamic \
       -Wl,--no-eh-frame-hdr \
       -Wl,-soname,libpdfium.so \
       -licuuc -licui18n -lfreetype -llcms2 -lopenjpeg -ljpeg -lpng -lz \

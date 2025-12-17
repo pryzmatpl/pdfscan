@@ -21,8 +21,8 @@ pub struct PdfViewer {
     text_data: Arc<Mutex<String>>,
     loading: bool,
     document_loaded: Arc<Mutex<Option<Arc<Document>>>>,
-    show_text_panel: bool,
     zoom: f32,
+    auto_fit: bool, // Auto-fit to screen height
     rendering_pages: Arc<Mutex<Vec<usize>>>, // Pages currently being rendered
     use_poppler: bool, // Whether poppler is available
     rendered_images: Arc<Mutex<HashMap<usize, (Vec<u8>, (u32, u32))>>>, // Rendered images waiting to be loaded as textures
@@ -74,8 +74,8 @@ impl PdfViewer {
             text_data: Arc::new(Mutex::new(String::new())),
             loading: false,
             document_loaded: Arc::new(Mutex::new(None)),
-            show_text_panel: false,
             zoom: 1.0,
+            auto_fit: true,
             rendering_pages: Arc::new(Mutex::new(Vec::new())),
             use_poppler,
             rendered_images: Arc::new(Mutex::new(HashMap::new())),
@@ -504,6 +504,20 @@ impl PdfViewer {
         self.total_pages
     }
     
+    /// Calculate zoom to fit page to available height
+    fn calculate_fit_zoom(&mut self, ctx: &Context) {
+        if let Some(texture) = self.page_textures.get(&self.current_page) {
+            let texture_size = texture.size_vec2();
+            if texture_size.y > 0.0 {
+                // Get available height from context (approximate)
+                let screen_height = ctx.screen_rect().height();
+                let available_height = screen_height * 0.7; // Leave space for controls
+                let scale = available_height / texture_size.y;
+                self.zoom = scale.min(3.0).max(0.1);
+            }
+        }
+    }
+    
     /// Jump to a specific page and optionally highlight a search term
     pub fn jump_to_page(&mut self, page_num: usize, search_term: Option<&str>, ctx: &Context) {
         if page_num < self.total_pages {
@@ -517,9 +531,9 @@ impl PdfViewer {
             // Extract text for the page
             self.extract_page_text(self.current_page);
             
-            // Enable text panel to show highlighting
-            if search_term.is_some() {
-                self.show_text_panel = true;
+            // Auto-fit if enabled
+            if self.auto_fit {
+                self.calculate_fit_zoom(ctx);
             }
         }
     }
@@ -595,7 +609,10 @@ impl PdfViewer {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             // Open PDF button
                             if ui.button("📂 Open PDF...").clicked() {
-                                if let Some(path) = Self::open_file_dialog() {
+                                if let Some(path) = rfd::FileDialog::new()
+                                    .add_filter("PDF Files", &["pdf"])
+                                    .pick_file()
+                                {
                                     self.load_pdf(&path);
                                 }
                             }
@@ -645,9 +662,12 @@ impl PdfViewer {
                         
                         ui.separator();
                         
-                        // Option to toggle text panel
-                        if ui.checkbox(&mut self.show_text_panel, "Show Text").clicked() {
-                            // Toggle was clicked, no additional action needed
+                        // Auto-fit toggle
+                        if ui.checkbox(&mut self.auto_fit, "Auto-fit").clicked() {
+                            if self.auto_fit {
+                                // Calculate fit zoom when enabled
+                                self.calculate_fit_zoom(ctx);
+                            }
                         }
                         
                         // Search in document
@@ -738,11 +758,20 @@ impl PdfViewer {
                                         let texture_size = texture.size_vec2();
                                         
                                         if texture_size.x > 0.0 && texture_size.y > 0.0 {
-                                            let size = texture_size * self.zoom;
+                                            // Calculate display size
+                                            let display_size = if self.auto_fit {
+                                                // Fit to available height
+                                                let available_height = ui.available_height() - 20.0; // Padding
+                                                let scale = available_height / texture_size.y;
+                                                let width = texture_size.x * scale;
+                                                Vec2::new(width, available_height)
+                                            } else {
+                                                texture_size * self.zoom
+                                            };
                                             
                                             ui.vertical_centered(|ui| {
                                                 let image = egui::Image::new(texture)
-                                                    .fit_to_exact_size(size);
+                                                    .fit_to_exact_size(display_size);
                                                 ui.add(image);
                                             });
                                         } else {
@@ -787,12 +816,17 @@ impl PdfViewer {
                                     .id_source("pdf_text")
                                     .show(ui, |ui| {
                                         if !page_data.text.is_empty() {
-                                            // Display text with better formatting
-                                            for line in page_data.text.lines() {
-                                                if !line.trim().is_empty() {
-                                                    ui.label(line);
-                                                } else {
-                                                    ui.add_space(5.0);
+                                            // Highlight search matches if search is active
+                                            if !self.search_query.is_empty() && !self.search_results.is_empty() {
+                                                self.display_text_with_highlights(ui, &page_data.text);
+                                            } else {
+                                                // Display text with better formatting
+                                                for line in page_data.text.lines() {
+                                                    if !line.trim().is_empty() {
+                                                        ui.label(line);
+                                                    } else {
+                                                        ui.add_space(5.0);
+                                                    }
                                                 }
                                             }
                                         } else {
@@ -806,12 +840,22 @@ impl PdfViewer {
                     });
                 });
             } else if self.loading {
-                // Show loading indicator
-                ui.vertical_centered(|ui| {
-                    ui.add_space(100.0);
-                    ui.label("Loading PDF...");
-                    ui.add_space(100.0);
-                });
+                // Show loading popup
+                egui::Window::new("Loading PDF")
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                    .show(ctx, |ui| {
+                        ui.vertical_centered(|ui| {
+                            ui.add_space(20.0);
+                            ui.spinner();
+                            ui.add_space(10.0);
+                            ui.label(RichText::new("Loading PDF...").heading());
+                            ui.add_space(5.0);
+                            ui.label("Extracting text and preparing document");
+                            ui.add_space(20.0);
+                        });
+                    });
             } else {
                 // Show welcome screen when no document is loaded
                 ui.vertical_centered(|ui| {
@@ -823,7 +867,10 @@ impl PdfViewer {
                     
                     ui.add_space(20.0);
                     if ui.button("📂 Open PDF...").clicked() {
-                        if let Some(path) = Self::open_file_dialog() {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("PDF Files", &["pdf"])
+                            .pick_file()
+                        {
                             self.load_pdf(&path);
                         }
                     }
@@ -1015,7 +1062,13 @@ impl PdfViewer {
             let first_page = self.search_results[0].0;
             let search_term = self.search_query.clone();
             self.current_match_index = Some(0);
-            self.jump_to_page(first_page, Some(&search_term), ctx);
+            // Update current page and render
+            self.current_page = first_page;
+            if self.use_poppler {
+                self.render_page(first_page, ctx);
+            }
+            self.extract_page_text(first_page);
+            ctx.request_repaint();
         }
     }
     
@@ -1025,13 +1078,22 @@ impl PdfViewer {
             let next_idx = (current_idx + 1) % self.search_results.len();
             self.current_match_index = Some(next_idx);
             let (page_num, _) = self.search_results[next_idx];
-            let search_term = self.search_query.clone();
-            self.jump_to_page(page_num, Some(&search_term), ctx);
+            // Jump to the page
+            self.current_page = page_num;
+            if self.use_poppler {
+                self.render_page(page_num, ctx);
+            }
+            self.extract_page_text(page_num);
+            ctx.request_repaint();
         } else if !self.search_results.is_empty() {
             self.current_match_index = Some(0);
             let (page_num, _) = self.search_results[0];
-            let search_term = self.search_query.clone();
-            self.jump_to_page(page_num, Some(&search_term), ctx);
+            self.current_page = page_num;
+            if self.use_poppler {
+                self.render_page(page_num, ctx);
+            }
+            self.extract_page_text(page_num);
+            ctx.request_repaint();
         }
     }
     
@@ -1045,23 +1107,26 @@ impl PdfViewer {
             };
             self.current_match_index = Some(prev_idx);
             let (page_num, _) = self.search_results[prev_idx];
-            let search_term = self.search_query.clone();
-            self.jump_to_page(page_num, Some(&search_term), ctx);
+            // Jump to the page
+            self.current_page = page_num;
+            if self.use_poppler {
+                self.render_page(page_num, ctx);
+            }
+            self.extract_page_text(page_num);
+            ctx.request_repaint();
         } else if !self.search_results.is_empty() {
             let last_idx = self.search_results.len().saturating_sub(1);
             self.current_match_index = Some(last_idx);
             let (page_num, _) = self.search_results[last_idx];
-            let search_term = self.search_query.clone();
-            self.jump_to_page(page_num, Some(&search_term), ctx);
+            self.current_page = page_num;
+            if self.use_poppler {
+                self.render_page(page_num, ctx);
+            }
+            self.extract_page_text(page_num);
+            ctx.request_repaint();
         }
     }
     
-    /// Open a file dialog
-    fn open_file_dialog() -> Option<PathBuf> {
-        rfd::FileDialog::new()
-            .add_filter("PDF Files", &["pdf"])
-            .pick_file()
-    }
 }
 
 /// Get PDF page count using pdfinfo (most reliable)

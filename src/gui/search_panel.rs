@@ -251,6 +251,12 @@ impl SearchPanel {
     
     /// Perform a search operation
     fn perform_search(&mut self, pdf_viewer: &PdfViewer) {
+        // Validate search query
+        if self.search_query.trim().is_empty() {
+            self.is_searching = false;
+            return;
+        }
+        
         self.is_searching = true;
         self.search_results.clear();
         
@@ -372,13 +378,25 @@ impl SearchPanel {
     }
     
     /// Search for matches in text
+    /// This method safely handles UTF-8 characters and prevents crashes
     fn search_in_text(&self, text: &str) -> Vec<MatchResult> {
         let mut matches = Vec::new();
+        
+        // Return early if query is empty
+        if self.search_query.is_empty() {
+            return matches;
+        }
+        
         let query = if self.case_sensitive {
             self.search_query.clone()
         } else {
             self.search_query.to_lowercase()
         };
+        
+        // If query is empty after processing, return
+        if query.is_empty() {
+            return matches;
+        }
         
         let search_text = if self.case_sensitive {
             text.to_string()
@@ -386,22 +404,76 @@ impl SearchPanel {
             text.to_lowercase()
         };
         
-        // Find all occurrences
-        let mut start = 0;
-        while let Some(pos) = search_text[start..].find(&query) {
-            let actual_pos = start + pos;
+        // Use char_indices to handle UTF-8 properly
+        let text_chars: Vec<(usize, char)> = text.char_indices().collect();
+        let search_chars: Vec<char> = search_text.chars().collect();
+        let query_chars: Vec<char> = query.chars().collect();
+        
+        if query_chars.is_empty() || search_chars.len() < query_chars.len() {
+            return matches;
+        }
+        
+        // Find all occurrences using character matching
+        let mut start_char_idx = 0;
+        while start_char_idx <= search_chars.len().saturating_sub(query_chars.len()) {
+            // Check if we have a match starting at start_char_idx
+            let mut matched = true;
+            for (i, &qc) in query_chars.iter().enumerate() {
+                if start_char_idx + i >= search_chars.len() || search_chars[start_char_idx + i] != qc {
+                    matched = false;
+                    break;
+                }
+            }
             
-            // Extract context (a few characters before and after)
-            let context_start = actual_pos.saturating_sub(40);
-            let context_end = (actual_pos + query.len() + 40).min(text.len());
-            let context = text[context_start..context_end].to_string();
-            
-            matches.push(MatchResult {
-                text: context,
-                position: actual_pos,
-            });
-            
-            start = actual_pos + query.len();
+            if matched {
+                // Found a match at start_char_idx
+                // Get the byte position in the original text
+                let byte_pos = if start_char_idx < text_chars.len() {
+                    text_chars[start_char_idx].0
+                } else {
+                    text.len()
+                };
+                
+                // Extract context (40 chars before and after)
+                let context_before = 40;
+                let context_after = 40;
+                
+                let context_start_char = start_char_idx.saturating_sub(context_before);
+                let context_end_char = (start_char_idx + query_chars.len() + context_after)
+                    .min(text_chars.len());
+                
+                // Get byte positions for context
+                let context_start_byte = if context_start_char < text_chars.len() {
+                    text_chars[context_start_char].0
+                } else {
+                    0
+                };
+                
+                let context_end_byte = if context_end_char < text_chars.len() {
+                    text_chars[context_end_char].0
+                } else {
+                    text.len()
+                };
+                
+                // Safely extract context
+                let context = if context_start_byte < context_end_byte && context_end_byte <= text.len() {
+                    text.get(context_start_byte..context_end_byte)
+                        .unwrap_or("")
+                        .to_string()
+                } else {
+                    String::new()
+                };
+                
+                matches.push(MatchResult {
+                    text: context,
+                    position: byte_pos,
+                });
+                
+                // Move past this match
+                start_char_idx += query_chars.len();
+            } else {
+                start_char_idx += 1;
+            }
         }
         
         matches
@@ -418,8 +490,9 @@ impl SearchPanel {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("📁 Select Directory").clicked() {
                         if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                            self.directory_path = Some(path);
+                            self.directory_path = Some(path.clone());
                             self.search_scope = SearchScope::Directory;
+                            self.load_directory_pdfs(&path);
                         }
                     }
                 });
@@ -547,7 +620,13 @@ impl SearchPanel {
                             pdf_viewer.load_pdf(pdf_path);
                         }
                         
-                        ui.label(RichText::new(&file_name).strong());
+                        // Limit filename length
+                        let display_name = if file_name.len() > 60 {
+                            format!("{}...", &file_name[..60])
+                        } else {
+                            file_name
+                        };
+                        ui.label(egui::RichText::new(display_name).strong());
                         
                         // Show if text is cached
                         if self.pdf_cache.contains_key(*pdf_path) {
@@ -555,7 +634,14 @@ impl SearchPanel {
                         }
                         
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.label(RichText::new(pdf_path.to_string_lossy().as_ref()).small().weak());
+                            // Truncate long paths
+                            let path_str = pdf_path.to_string_lossy();
+                            let display_path = if path_str.len() > 80 {
+                                format!("...{}", &path_str[path_str.len().saturating_sub(80)..])
+                            } else {
+                                path_str.to_string()
+                            };
+                            ui.label(egui::RichText::new(display_path).small().weak());
                         });
                     });
                     
@@ -600,10 +686,19 @@ impl SearchPanel {
                 ui.add_space(20.0);
             });
         } else {
+            // Limit number of results displayed to prevent UI issues
+            let max_results_to_show = 100;
+            let results_to_show: Vec<&SearchResult> = self.search_results.iter().take(max_results_to_show).collect();
+            
             egui::ScrollArea::vertical()
                 .auto_shrink([false; 2])
                 .show(ui, |ui| {
-                    for result in &self.search_results {
+                    if self.search_results.len() > max_results_to_show {
+                        ui.label(format!("Showing first {} of {} results", max_results_to_show, self.search_results.len()));
+                        ui.separator();
+                    }
+                    
+                    for result in results_to_show {
                         // Format header with file name and match count
                         let header = format!(
                             "{} ({} {})", 
@@ -619,28 +714,33 @@ impl SearchPanel {
                                     if ui.button("Open PDF").clicked() {
                                         pdf_viewer.load_pdf(&result.file_path);
                                     }
-                                    ui.label(RichText::new(&*result.file_path.to_string_lossy()).monospace());
+                                    // Truncate long paths to prevent rendering issues
+                                    let path_str = result.file_path.to_string_lossy();
+                                    let display_path = if path_str.len() > 100 {
+                                        format!("...{}", &path_str[path_str.len().saturating_sub(100)..])
+                                    } else {
+                                        path_str.to_string()
+                                    };
+                                    ui.label(egui::RichText::new(display_path).monospace());
                                 });
                                 
                                 ui.add_space(5.0);
                                 
-                                // Show matches
-                                for (i, m) in result.matches.iter().enumerate() {
+                                // Show matches (limit to prevent UI issues)
+                                let max_matches_to_show = 50;
+                                for (i, m) in result.matches.iter().take(max_matches_to_show).enumerate() {
                                     ui.group(|ui| {
-                                        // Create a highlighted version of the text
-                                        let text = if self.search_query.is_empty() {
-                                            m.text.clone()
+                                        // Limit text length to prevent rendering issues
+                                        const MAX_TEXT_LENGTH: usize = 200;
+                                        let display_text = if m.text.len() > MAX_TEXT_LENGTH {
+                                            format!("{}...", &m.text[..MAX_TEXT_LENGTH.min(m.text.len())])
                                         } else {
-                                            // Highlight all occurrences of the search query
-                                            let parts: Vec<&str> = m.text.split(&self.search_query).collect();
-                                            if parts.len() <= 1 {
-                                                m.text.clone()
-                                            } else {
-                                                parts.join(&format!("<<{}>>", &self.search_query))
-                                            }
+                                            m.text.clone()
                                         };
                                         
-                                        ui.label(format!("{}. ...{}...", i + 1, text));
+                                        // Use simple label instead of complex RichText formatting
+                                        // to avoid font rendering issues
+                                        ui.label(format!("{}. {}", i + 1, display_text));
                                         
                                         if ui.button("Jump to match").clicked() {
                                             // Calculate the approximate page number based on position
@@ -657,6 +757,11 @@ impl SearchPanel {
                                             }
                                         }
                                     });
+                                }
+                                
+                                // Show message if there are more matches
+                                if result.matches.len() > max_matches_to_show {
+                                    ui.label(format!("... and {} more matches", result.matches.len() - max_matches_to_show));
                                 }
                             });
                     }
@@ -699,4 +804,4 @@ fn search_phrase_in_pdf(file_path: &Path, search_phrase: &str) -> Result<bool, B
     let text = pdf_extract::extract_text_from_mem(&bytes)?;
     
     Ok(text.contains(search_phrase))
-} 
+}

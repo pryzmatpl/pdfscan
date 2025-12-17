@@ -33,6 +33,10 @@ default = ["cli", "gui"]
 cli = []
 gui = []
 
+[lib]
+name = "pdfscan"
+path = "src/lib.rs"
+
 [[bin]]
 name = "pdfscan"
 path = "src/main.rs"

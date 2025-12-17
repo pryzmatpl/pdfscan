@@ -688,40 +688,57 @@ impl PdfViewer {
                                                     
                                                     if let Some(query) = search_query {
                                                         if !query.is_empty() {
-                                                            // Highlight all occurrences of the search term
-                                                            let mut remaining_text = page_data.text.as_str();
-                                                            let mut last_end = 0;
+                                                            // Limit text length to prevent rendering issues
+                                                            const MAX_DISPLAY_LENGTH: usize = 10000;
+                                                            let display_text = if page_data.text.len() > MAX_DISPLAY_LENGTH {
+                                                                &page_data.text[..MAX_DISPLAY_LENGTH]
+                                                            } else {
+                                                                &page_data.text
+                                                            };
                                                             
-                                                            while let Some(pos) = remaining_text.to_lowercase().find(&query.to_lowercase()) {
-                                                                let start = last_end + pos;
-                                                                let end = start + query.len();
-                                                                
-                                                                // Add text before match
-                                                                if start > last_end {
-                                                                    ui.label(&page_data.text[last_end..start]);
-                                                                }
-                                                                
-                                                                // Add highlighted match
-                                                                ui.label(
-                                                                    RichText::new(&page_data.text[start..end])
-                                                                        .background_color(Color32::from_rgb(255, 255, 0))
-                                                                        .strong()
-                                                                );
-                                                                
-                                                                // Update position
-                                                                remaining_text = &remaining_text[pos + query.len()..];
-                                                                last_end = end;
+                                                            // Use simple highlighting to avoid font rendering crashes
+                                                            // Find matches using character-based search
+                                                            let query_lower = query.to_lowercase();
+                                                            let text_lower = display_text.to_lowercase();
+                                                            
+                                                            // Simple approach: just show text with a note about matches
+                                                            let match_count = text_lower.matches(&query_lower).count();
+                                                            if match_count > 0 {
+                                                                ui.label(egui::RichText::new(format!("Found {} match(es) in text", match_count)).color(Color32::YELLOW));
                                                             }
                                                             
-                                                            // Add remaining text
-                                                            if last_end < page_data.text.len() {
-                                                                ui.label(&page_data.text[last_end..]);
+                                                            // Display text with reasonable length limit per line
+                                                            let lines: Vec<&str> = display_text.lines().take(100).collect();
+                                                            for line in lines {
+                                                                if line.len() > 200 {
+                                                                    ui.label(format!("{}...", &line[..200]));
+                                                                } else {
+                                                                    ui.label(line);
+                                                                }
+                                                            }
+                                                            
+                                                            if display_text.len() > MAX_DISPLAY_LENGTH {
+                                                                ui.label("... (text truncated)");
                                                             }
                                                         } else {
-                                                            ui.label(&page_data.text);
+                                                            // Limit display length even without highlighting
+                                                            const MAX_DISPLAY_LENGTH: usize = 10000;
+                                                            let display_text = if page_data.text.len() > MAX_DISPLAY_LENGTH {
+                                                                format!("{}...", &page_data.text[..MAX_DISPLAY_LENGTH])
+                                                            } else {
+                                                                page_data.text.clone()
+                                                            };
+                                                            ui.label(display_text);
                                                         }
                                                     } else {
-                                                        ui.label(&page_data.text);
+                                                        // Limit display length
+                                                        const MAX_DISPLAY_LENGTH: usize = 10000;
+                                                        let display_text = if page_data.text.len() > MAX_DISPLAY_LENGTH {
+                                                            format!("{}...", &page_data.text[..MAX_DISPLAY_LENGTH])
+                                                        } else {
+                                                            page_data.text.clone()
+                                                        };
+                                                        ui.label(display_text);
                                                     }
                                                 } else {
                                                     ui.label("No text content available");

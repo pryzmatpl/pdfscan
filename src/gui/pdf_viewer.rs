@@ -26,6 +26,10 @@ pub struct PdfViewer {
     rendering_pages: Arc<Mutex<Vec<usize>>>, // Pages currently being rendered
     use_poppler: bool, // Whether poppler is available
     rendered_images: Arc<Mutex<HashMap<usize, (Vec<u8>, (u32, u32))>>>, // Rendered images waiting to be loaded as textures
+    search_query: String, // Search query for current document
+    search_results: Vec<(usize, usize)>, // (page_num, position) for search matches
+    current_match_index: Option<usize>, // Current match being viewed
+    case_sensitive: bool, // Case sensitive search
 }
 
 /// Page data
@@ -75,6 +79,10 @@ impl PdfViewer {
             rendering_pages: Arc::new(Mutex::new(Vec::new())),
             use_poppler,
             rendered_images: Arc::new(Mutex::new(HashMap::new())),
+            search_query: String::new(),
+            search_results: Vec::new(),
+            current_match_index: None,
+            case_sensitive: false,
         }
     }
     
@@ -98,7 +106,7 @@ impl PdfViewer {
         
         // Load the PDF in a separate thread
         std::thread::spawn(move || {
-            // Load with lopdf for structure parsing (optional, for compatibility)
+            // Load with lopdf for structure parsing
             let lopdf_result = Document::load(&path_clone);
             
             // Extract text for search and analysis
@@ -118,7 +126,7 @@ impl PdfViewer {
                 let mut document_loaded = document_loaded.lock().unwrap();
                 *document_loaded = Some(doc);
             } else {
-                eprintln!("Error loading PDF with lopdf (optional)");
+                eprintln!("Error loading PDF with lopdf (will try pdfinfo for page count)");
             }
         });
     }
@@ -126,6 +134,17 @@ impl PdfViewer {
     /// Process loaded document (should be called from the UI thread)
     fn process_loaded_document(&mut self, ctx: &Context) {
         if self.loading {
+            // First, try to get page count from poppler (most reliable)
+            if self.total_pages == 0 {
+                if let Some(pdf_path) = &self.current_pdf_path {
+                    let page_count = get_pdf_page_count(pdf_path);
+                    if page_count > 0 {
+                        self.total_pages = page_count;
+                        eprintln!("Got page count from poppler: {}", page_count);
+                    }
+                }
+            }
+            
             // Check if document has been loaded by the background thread
             let doc_option = {
                 let mut document_loaded = self.document_loaded.lock().unwrap();
@@ -136,8 +155,14 @@ impl PdfViewer {
                 // Update state with the loaded document
                 self.document = Some(doc.clone());
                 
-                // Get page count from lopdf
-                self.total_pages = doc.get_pages().len();
+                // Get page count from lopdf (use if we don't have one from poppler)
+                let lopdf_pages = doc.get_pages().len();
+                if self.total_pages == 0 {
+                    self.total_pages = lopdf_pages;
+                    eprintln!("Got page count from lopdf: {}", lopdf_pages);
+                } else if lopdf_pages != self.total_pages {
+                    eprintln!("Page count mismatch: lopdf={}, using poppler={}", lopdf_pages, self.total_pages);
+                }
                 
                 // Render first page if poppler is available
                 if self.use_poppler && self.total_pages > 0 {
@@ -163,6 +188,7 @@ impl PdfViewer {
                         text_data.len()
                     };
                     self.total_pages = (text_len / 2000).max(1);
+                    eprintln!("Estimated page count from text: {}", self.total_pages);
                 }
                 
                 // Mark as not loading if we have some data
@@ -624,6 +650,47 @@ impl PdfViewer {
                             // Toggle was clicked, no additional action needed
                         }
                         
+                        // Search in document
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            ui.label("🔍");
+                            let search_response = ui.text_edit_singleline(&mut self.search_query);
+                            
+                            if search_response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                                self.search_in_document(ctx);
+                            }
+                            
+                            if !self.search_query.is_empty() {
+                                if ui.button("✕").clicked() {
+                                    self.search_query.clear();
+                                    self.search_results.clear();
+                                    self.current_match_index = None;
+                                }
+                                
+                                if ui.button("Search").clicked() {
+                                    self.search_in_document(ctx);
+                                }
+                                
+                                // Show match count
+                                if !self.search_results.is_empty() {
+                                    let match_text = format!("{}/{}", 
+                                        self.current_match_index.map(|i| i + 1).unwrap_or(0),
+                                        self.search_results.len());
+                                    ui.label(RichText::new(match_text).small());
+                                    
+                                    // Navigation buttons
+                                    if ui.button("◀").clicked() {
+                                        self.previous_match(ctx);
+                                    }
+                                    if ui.button("▶").clicked() {
+                                        self.next_match(ctx);
+                                    }
+                                }
+                            }
+                        });
+                        
+                        ui.checkbox(&mut self.case_sensitive, "Case sensitive");
+                        
                         // Show rendering status
                         if self.use_poppler {
                             ui.label(RichText::new("🖼️ Rendering").small().weak());
@@ -806,12 +873,216 @@ impl PdfViewer {
         }
     }
 
+    /// Display text with search highlights
+    fn display_text_with_highlights(&self, ui: &mut Ui, text: &str) {
+        let query = if self.case_sensitive {
+            self.search_query.clone()
+        } else {
+            self.search_query.to_lowercase()
+        };
+        
+        let search_text = if self.case_sensitive {
+            text.to_string()
+        } else {
+            text.to_lowercase()
+        };
+        
+        // Simple highlighting: split text by matches and highlight them
+        let mut last_pos = 0;
+        let query_lower = query.to_lowercase();
+        
+        // Find all match positions in this page's text
+        let mut matches = Vec::new();
+        let mut search_pos = 0;
+        while let Some(pos) = search_text[search_pos..].find(&query_lower) {
+            let absolute_pos = search_pos + pos;
+            matches.push(absolute_pos);
+            search_pos = absolute_pos + query_lower.len();
+        }
+        
+        // Display text with highlights
+        if matches.is_empty() {
+            // No matches on this page, just show text normally
+            for line in text.lines() {
+                if !line.trim().is_empty() {
+                    ui.label(line);
+                } else {
+                    ui.add_space(5.0);
+                }
+            }
+        } else {
+            // Show text with highlighted matches
+            let mut display_text = text.to_string();
+            // Simple approach: just show text and indicate matches
+            ui.label(format!("Found {} match(es) on this page", matches.len()));
+            ui.separator();
+            
+            for line in text.lines() {
+                if !line.trim().is_empty() {
+                    // Check if line contains match
+                    let line_lower = line.to_lowercase();
+                    if line_lower.contains(&query_lower) {
+                        ui.label(RichText::new(line).background_color(Color32::from_rgb(255, 255, 0)));
+                    } else {
+                        ui.label(line);
+                    }
+                } else {
+                    ui.add_space(5.0);
+                }
+            }
+        }
+    }
+    
+    /// Search in the current document
+    fn search_in_document(&mut self, ctx: &Context) {
+        if self.search_query.trim().is_empty() {
+            self.search_results.clear();
+            self.current_match_index = None;
+            return;
+        }
+        
+        self.search_results.clear();
+        self.current_match_index = None;
+        
+        // Get all text from the document
+        let full_text = {
+            let text_data = self.text_data.lock().unwrap();
+            text_data.clone()
+        };
+        
+        if full_text.is_empty() {
+            return;
+        }
+        
+        // Search through all pages
+        let query = if self.case_sensitive {
+            self.search_query.clone()
+        } else {
+            self.search_query.to_lowercase()
+        };
+        
+        let search_text = if self.case_sensitive {
+            full_text.clone()
+        } else {
+            full_text.to_lowercase()
+        };
+        
+        // Find all matches and determine which page they're on
+        let text_chars: Vec<(usize, char)> = full_text.char_indices().collect();
+        let search_chars: Vec<char> = search_text.chars().collect();
+        let query_chars: Vec<char> = query.chars().collect();
+        
+        if query_chars.is_empty() || search_chars.len() < query_chars.len() {
+            return;
+        }
+        
+        // Estimate which page each match is on based on text position
+        let total_chars = full_text.chars().count();
+        let chars_per_page = if self.total_pages > 0 {
+            total_chars / self.total_pages.max(1)
+        } else {
+            total_chars
+        };
+        
+        let mut start_char_idx = 0;
+        while start_char_idx <= search_chars.len().saturating_sub(query_chars.len()) {
+            let mut matched = true;
+            for (i, &query_char) in query_chars.iter().enumerate() {
+                if start_char_idx + i >= search_chars.len() || search_chars[start_char_idx + i] != query_char {
+                    matched = false;
+                    break;
+                }
+            }
+            
+            if matched {
+                // Calculate which page this match is on
+                let char_position = text_chars.get(start_char_idx).map(|(pos, _)| *pos).unwrap_or(0);
+                let estimated_page = if chars_per_page > 0 {
+                    (char_position / chars_per_page).min(self.total_pages.saturating_sub(1))
+                } else {
+                    0
+                };
+                
+                self.search_results.push((estimated_page, char_position));
+                start_char_idx += query_chars.len();
+            } else {
+                start_char_idx += 1;
+            }
+        }
+        
+        // Jump to first match if any found
+        if !self.search_results.is_empty() {
+            let first_page = self.search_results[0].0;
+            let search_term = self.search_query.clone();
+            self.current_match_index = Some(0);
+            self.jump_to_page(first_page, Some(&search_term), ctx);
+        }
+    }
+    
+    /// Jump to next search match
+    fn next_match(&mut self, ctx: &Context) {
+        if let Some(current_idx) = self.current_match_index {
+            let next_idx = (current_idx + 1) % self.search_results.len();
+            self.current_match_index = Some(next_idx);
+            let (page_num, _) = self.search_results[next_idx];
+            let search_term = self.search_query.clone();
+            self.jump_to_page(page_num, Some(&search_term), ctx);
+        } else if !self.search_results.is_empty() {
+            self.current_match_index = Some(0);
+            let (page_num, _) = self.search_results[0];
+            let search_term = self.search_query.clone();
+            self.jump_to_page(page_num, Some(&search_term), ctx);
+        }
+    }
+    
+    /// Jump to previous search match
+    fn previous_match(&mut self, ctx: &Context) {
+        if let Some(current_idx) = self.current_match_index {
+            let prev_idx = if current_idx == 0 {
+                self.search_results.len().saturating_sub(1)
+            } else {
+                current_idx - 1
+            };
+            self.current_match_index = Some(prev_idx);
+            let (page_num, _) = self.search_results[prev_idx];
+            let search_term = self.search_query.clone();
+            self.jump_to_page(page_num, Some(&search_term), ctx);
+        } else if !self.search_results.is_empty() {
+            let last_idx = self.search_results.len().saturating_sub(1);
+            self.current_match_index = Some(last_idx);
+            let (page_num, _) = self.search_results[last_idx];
+            let search_term = self.search_query.clone();
+            self.jump_to_page(page_num, Some(&search_term), ctx);
+        }
+    }
+    
     /// Open a file dialog
     fn open_file_dialog() -> Option<PathBuf> {
         rfd::FileDialog::new()
             .add_filter("PDF Files", &["pdf"])
             .pick_file()
     }
+}
+
+/// Get PDF page count using pdfinfo (most reliable)
+fn get_pdf_page_count(path: &Path) -> usize {
+    if let Ok(info_output) = Command::new("pdfinfo")
+        .arg(path)
+        .output()
+    {
+        let info_str = String::from_utf8_lossy(&info_output.stdout);
+        for line in info_str.lines() {
+            if line.starts_with("Pages:") {
+                if let Some(count_str) = line.split(':').nth(1) {
+                    if let Ok(count) = count_str.trim().parse::<usize>() {
+                        return count;
+                    }
+                }
+            }
+        }
+    }
+    
+    0 // Could not determine page count
 }
 
 /// Extract text from a PDF file safely, handling panics

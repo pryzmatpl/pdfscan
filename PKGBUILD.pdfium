@@ -1,0 +1,71 @@
+# PKGBUILD for Pdfium built against system ICU
+# This builds Pdfium from source to match your system's ICU version
+
+pkgname=pdfium-system
+pkgver=latest
+pkgrel=1
+pkgdesc="Pdfium library built against system ICU (for pdfscan project)"
+arch=('x86_64')
+url="https://pdfium.googlesource.com/pdfium"
+license=('BSD')
+depends=('icu' 'freetype2' 'lcms2' 'openjpeg2' 'libjpeg-turbo' 'zlib')
+makedepends=('git' 'python' 'ninja' 'gn' 'base-devel')
+source=()
+md5sums=()
+
+prepare() {
+  cd "$srcdir"
+  
+  if [ ! -d "pdfium" ]; then
+    git clone https://pdfium.googlesource.com/pdfium
+  fi
+  
+  cd pdfium
+  git pull
+}
+
+build() {
+  cd "$srcdir/pdfium"
+  
+  # Install depot_tools if not present
+  if [ ! -d "depot_tools" ]; then
+    git clone https://chromium.googlesource.com/chromium/tools/depot_tools.git
+  fi
+  export PATH="$PATH:$srcdir/pdfium/depot_tools"
+  
+  # Fetch dependencies
+  gclient sync
+  
+  # Configure build to use system ICU
+  mkdir -p out/Default
+  cat > out/Default/args.gn << EOF
+is_debug = false
+is_component_build = false
+pdf_enable_xfa = false
+pdf_enable_v8 = false
+pdf_use_skia = false
+pdf_use_skia_paths = false
+use_system_icu = true
+use_system_freetype = true
+use_system_lcms2 = true
+use_system_libjpeg = true
+use_system_libpng = true
+use_system_zlib = true
+EOF
+  
+  # Build Pdfium
+  gn gen out/Default
+  ninja -C out/Default pdfium
+}
+
+package() {
+  cd "$srcdir/pdfium"
+  
+  # Install library
+  install -Dm755 out/Default/libpdfium.so "$pkgdir/usr/lib/libpdfium.so"
+  
+  # Install headers (if needed)
+  mkdir -p "$pkgdir/usr/include/pdfium"
+  cp -r public/* "$pkgdir/usr/include/pdfium/" 2>/dev/null || true
+}
+

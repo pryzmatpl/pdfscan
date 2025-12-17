@@ -63,7 +63,23 @@ struct OutlineItem {
 impl PdfViewer {
     pub fn new() -> Self {
         // Try to initialize pdfium once at startup
-        let pdfium = match Pdfium::bind_to_system_library() {
+        // First try system library, then try custom-built library in user directory
+        let pdfium = Pdfium::bind_to_system_library()
+            .or_else(|_| {
+                // Try custom-built Pdfium in user's local directory
+                let custom_path = std::path::Path::new(&std::env::var("HOME").unwrap_or_default())
+                    .join(".local/pdfium/lib/libpdfium.so");
+                if custom_path.exists() {
+                    Pdfium::bind_to_library(Pdfium::pdfium_platform_library_name_at_path(
+                        custom_path.parent().unwrap().to_str().unwrap()
+                    ))
+                } else {
+                    // Return the original error if custom path doesn't exist
+                    Pdfium::bind_to_system_library()
+                }
+            });
+        
+        let pdfium = match pdfium {
             Ok(bindings) => {
                 println!("Successfully initialized Pdfium");
                 Some(Pdfium::new(bindings))
@@ -71,9 +87,25 @@ impl PdfViewer {
             Err(err) => {
                 eprintln!("Failed to initialize Pdfium: {}", err);
                 eprintln!("Note: PDF rendering will not be available. Text extraction and search will still work.");
-                eprintln!("To enable PDF rendering, install the required system libraries:");
-                eprintln!("  - On Arch Linux: sudo pacman -S icu");
-                eprintln!("  - On Ubuntu/Debian: sudo apt-get install libicu-dev");
+                
+                // Check if it's an ICU version mismatch
+                let err_str = format!("{}", err);
+                if err_str.contains("libicuuc.so.76") || err_str.contains("u_isspace_76") {
+                    eprintln!("\n⚠ ICU Version Mismatch Detected:");
+                    eprintln!("Pdfium was compiled against ICU 76, but your system has ICU 78.");
+                    eprintln!("");
+                    eprintln!("Solutions:");
+                    eprintln!("1. Build Pdfium from source against system ICU:");
+                    eprintln!("   Run: ./build-pdfium.sh");
+                    eprintln!("   Then copy: sudo cp ~/.local/pdfium/lib/libpdfium.so /usr/lib/");
+                    eprintln!("");
+                    eprintln!("2. Or use the PKGBUILD to create a system package:");
+                    eprintln!("   makepkg -si -f PKGBUILD.pdfium");
+                } else {
+                    eprintln!("To enable PDF rendering, install the required system libraries:");
+                    eprintln!("  - On Arch Linux: sudo pacman -S icu");
+                    eprintln!("  - On Ubuntu/Debian: sudo apt-get install libicu-dev");
+                }
                 None
             }
         };

@@ -3,7 +3,6 @@ use std::sync::{Arc, Mutex};
 use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::panic::AssertUnwindSafe;
-use eframe::glow::Texture;
 use egui::{Context, Ui, Vec2, RichText, Color32, TextureHandle};
 use lopdf::Document;
 use image::{ImageBuffer, Rgba};

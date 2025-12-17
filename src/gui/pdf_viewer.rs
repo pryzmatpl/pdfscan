@@ -652,11 +652,14 @@ impl PdfViewer {
                 
                 // Display the PDF content with side-by-side layout
                 egui::CentralPanel::default().show_inside(ui, |ui| {
+                    let available_size = ui.available_size();
+                    
                     ui.horizontal(|ui| {
                         // Left side: Rendered page (or placeholder)
                         ui.vertical(|ui| {
-                            let available_width = ui.available_width();
-                            ui.set_width(available_width * 0.65); // 65% for image
+                            let image_width = available_size.x * 0.65;
+                            ui.set_width(image_width);
+                            ui.set_min_height(available_size.y);
                             
                             egui::ScrollArea::both()
                                 .auto_shrink([false; 2])
@@ -666,8 +669,6 @@ impl PdfViewer {
                                     if let Some(texture) = self.page_textures.get(&self.current_page) {
                                         // Show rendered page image
                                         let texture_size = texture.size_vec2();
-                                        eprintln!("Displaying texture for page {}: {:?}, zoom: {}", 
-                                            self.current_page, texture_size, self.zoom);
                                         
                                         if texture_size.x > 0.0 && texture_size.y > 0.0 {
                                             let size = texture_size * self.zoom;
@@ -707,7 +708,9 @@ impl PdfViewer {
                         
                         // Right side: Text content (always shown)
                         ui.vertical(|ui| {
-                            ui.set_width(ui.available_width()); // Remaining space for text
+                            let text_width = ui.available_width();
+                            ui.set_width(text_width);
+                            ui.set_min_height(available_size.y);
                             
                             ui.heading("Text Content");
                             ui.separator();

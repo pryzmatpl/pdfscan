@@ -814,23 +814,25 @@ impl PdfViewer {
     }
 }
 
-/// Extract text from a PDF file using the pdf-extract library
-/// Note: May produce Unicode warnings (harmless) and can panic on malformed PDFs
+/// Extract text from a PDF file safely, handling panics
 fn extract_text_from_pdf(path: &Path) -> Result<String, Box<dyn std::error::Error>> {
     let bytes = std::fs::read(path)?;
-    // Suppress stderr during extraction to reduce noise from Unicode warnings
-    let text = std::panic::catch_unwind(|| {
+    
+    // Wrap in panic handler to prevent crashes from malformed PDFs
+    let text = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         pdf_extract::extract_text_from_mem(&bytes)
-    });
+    }));
     
     match text {
         Ok(Ok(text)) => Ok(text),
-        Ok(Err(e)) => Err(Box::new(e)),
+        Ok(Err(e)) => {
+            eprintln!("Error extracting text from {}: {}", path.display(), e);
+            Ok(String::new()) // Return empty string on error, don't fail completely
+        },
         Err(_) => {
             // Panic occurred (likely from type1-encoding-parser with malformed fonts)
-            // Return empty text rather than crashing
-            eprintln!("Warning: PDF text extraction encountered an error (malformed PDF?)");
-            Ok(String::new())
+            eprintln!("Warning: PDF text extraction panicked for {} (malformed PDF?)", path.display());
+            Ok(String::new()) // Return empty string rather than crashing
         }
     }
 } 

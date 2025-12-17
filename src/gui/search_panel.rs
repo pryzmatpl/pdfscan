@@ -191,29 +191,79 @@ impl SearchPanel {
             let is_loading_arc = Arc::new(Mutex::new(true));
             let is_loading_clone = is_loading_arc.clone();
             
-            // Load PDFs in a background thread for text extraction
-            std::thread::spawn(move || {
-                let mut cache = HashMap::new();
+            // Create cache directory
+            let cache_dir = get_cache_directory(&dir_path);
+            let cache_dir_clone = cache_dir.clone();
+            
+            // Load PDFs with thread pool (1 thread per 20 files)
+            const FILES_PER_THREAD: usize = 20;
+            let num_threads = (pdfs.len() + FILES_PER_THREAD - 1) / FILES_PER_THREAD;
+            
+            let pdfs_arc = Arc::new(pdfs);
+            let mut handles = Vec::new();
+            
+            for thread_idx in 0..num_threads {
+                let pdfs_clone = pdfs_arc.clone();
+                let cache_dir_thread = cache_dir_clone.clone();
+                let progress_clone_thread = progress_clone.clone();
+                let pdf_cache_clone_thread = pdf_cache_clone.clone();
+                let is_loading_clone_thread = is_loading_clone.clone();
                 
-                // Extract text from each PDF
-                for (idx, pdf_path) in pdfs.iter().enumerate() {
-                    if let Ok(bytes) = std::fs::read(pdf_path) {
-                        if let Ok(text) = pdf_extract::extract_text_from_mem(&bytes) {
-                            cache.insert(pdf_path.clone(), text);
+                let handle = std::thread::spawn(move || {
+                    let start_idx = thread_idx * FILES_PER_THREAD;
+                    let end_idx = (start_idx + FILES_PER_THREAD).min(pdfs_clone.len());
+                    
+                    let mut local_cache = HashMap::new();
+                    
+                    // Process files assigned to this thread
+                    for idx in start_idx..end_idx {
+                        let pdf_path = &pdfs_clone[idx];
+                        
+                        // Check cache first
+                        let cache_path = get_cache_path(pdf_path, &cache_dir_thread);
+                        let text = if let Some(cached_text) = load_text_from_cache(&cache_path) {
+                            // Use cached text
+                            cached_text
+                        } else {
+                            // Extract text and save to cache
+                            match extract_text_from_pdf_safe(pdf_path) {
+                                Ok(extracted_text) => {
+                                    // Save to cache (ignore errors)
+                                    let _ = save_text_to_cache(&cache_path, &extracted_text);
+                                    extracted_text
+                                },
+                                Err(e) => {
+                                    eprintln!("Failed to extract text from {}: {}", pdf_path.display(), e);
+                                    String::new()
+                                }
+                            }
+                        };
+                        
+                        if !text.is_empty() {
+                            local_cache.insert(pdf_path.clone(), text);
+                        }
+                        
+                        // Update progress
+                        {
+                            let mut prog = progress_clone_thread.lock().unwrap();
+                            *prog = Some((idx + 1, pdfs_clone.len()));
                         }
                     }
                     
-                    // Update progress
+                    // Merge local cache into shared cache
                     {
-                        let mut prog = progress_clone.lock().unwrap();
-                        *prog = Some((idx + 1, pdfs.len()));
+                        let mut cache_guard = pdf_cache_clone_thread.lock().unwrap();
+                        cache_guard.extend(local_cache);
                     }
-                }
+                });
                 
-                // Store cache results
-                {
-                    let mut cache_guard = pdf_cache_clone.lock().unwrap();
-                    *cache_guard = cache;
+                handles.push(handle);
+            }
+            
+            // Spawn a thread to wait for all workers and mark completion
+            std::thread::spawn(move || {
+                for handle in handles {
+                    let _ = handle.join();
                 }
                 
                 // Mark loading as complete
@@ -296,18 +346,34 @@ impl SearchPanel {
                     let text = if let Some(cached_text) = pdf_cache.get(pdf_path) {
                         cached_text.clone()
                     } else {
-                        // Extract text on the fly and cache it
-                        if let Ok(bytes) = std::fs::read(pdf_path) {
-                            if let Ok(extracted_text) = pdf_extract::extract_text_from_mem(&bytes) {
-                                // Cache the text for future searches
-                                self.pdf_cache.insert(pdf_path.clone(), extracted_text.clone());
-                                extracted_text
-                            } else {
-                                continue;
-                            }
+                        // Try to load from cache file first
+                        let cache_dir = if let Some(dir) = &self.directory_path {
+                            get_cache_directory(dir)
                         } else {
-                            continue;
-                        }
+                            pdf_path.parent().unwrap_or_else(|| Path::new(".")).to_path_buf()
+                        };
+                        let cache_path = get_cache_path(pdf_path, &cache_dir);
+                        
+                        let extracted_text = if let Some(cached_text) = load_text_from_cache(&cache_path) {
+                            // Use cached text
+                            cached_text
+                        } else {
+                            // Extract text safely and save to cache
+                            match extract_text_from_pdf_safe(pdf_path) {
+                                Ok(text) => {
+                                    // Save to cache (ignore errors)
+                                    let _ = save_text_to_cache(&cache_path, &text);
+                                    text
+                                },
+                                Err(_) => {
+                                    continue; // Skip this PDF if extraction fails
+                                }
+                            }
+                        };
+                        
+                        // Cache in memory for this session
+                        self.pdf_cache.insert(pdf_path.clone(), extracted_text.clone());
+                        extracted_text
                     };
                     
                     // Search in text
@@ -797,11 +863,78 @@ fn search_files_in_directory(dir: &PathBuf, search_phrase: &str) -> Result<Vec<P
     Ok(results)
 }
 
-/// Check if a PDF file contains the search phrase
+/// Check if a PDF file contains the search phrase (safely)
 fn search_phrase_in_pdf(file_path: &Path, search_phrase: &str) -> Result<bool, Box<dyn std::error::Error>> {
-    let bytes = std::fs::read(file_path)?;
+    // Try cache first
+    let cache_dir = file_path.parent().unwrap_or_else(|| Path::new("."));
+    let cache_path = get_cache_path(file_path, cache_dir);
     
-    let text = pdf_extract::extract_text_from_mem(&bytes)?;
+    let text = if let Some(cached_text) = load_text_from_cache(&cache_path) {
+        cached_text
+    } else {
+        // Extract text safely
+        match extract_text_from_pdf_safe(file_path) {
+            Ok(extracted_text) => {
+                // Save to cache
+                let _ = save_text_to_cache(&cache_path, &extracted_text);
+                extracted_text
+            },
+            Err(e) => {
+                return Err(e); // Return error if extraction fails
+            }
+        }
+    };
     
     Ok(text.contains(search_phrase))
+}
+
+/// Extract text from a PDF file safely, handling panics
+fn extract_text_from_pdf_safe(path: &Path) -> Result<String, Box<dyn std::error::Error>> {
+    let bytes = std::fs::read(path)?;
+    
+    // Wrap in panic handler to prevent crashes from malformed PDFs
+    let text = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        pdf_extract::extract_text_from_mem(&bytes)
+    }));
+    
+    match text {
+        Ok(Ok(text)) => Ok(text),
+        Ok(Err(e)) => {
+            eprintln!("Error extracting text from {}: {}", path.display(), e);
+            Ok(String::new()) // Return empty string on error, don't fail completely
+        },
+        Err(_) => {
+            // Panic occurred (likely from type1-encoding-parser with malformed fonts)
+            eprintln!("Warning: PDF text extraction panicked for {} (malformed PDF?)", path.display());
+            Ok(String::new()) // Return empty string rather than crashing
+        }
+    }
+}
+
+/// Get cache file path for a PDF
+fn get_cache_path(pdf_path: &Path, cache_dir: &Path) -> PathBuf {
+    let pdf_name = pdf_path.file_stem()
+        .unwrap_or_default()
+        .to_string_lossy();
+    cache_dir.join(format!("{}.txt", pdf_name))
+}
+
+/// Get or create .pdfscan cache directory
+fn get_cache_directory(pdf_dir: &Path) -> PathBuf {
+    pdf_dir.join(".pdfscan")
+}
+
+/// Load text from cache file if it exists
+fn load_text_from_cache(cache_path: &Path) -> Option<String> {
+    std::fs::read_to_string(cache_path).ok()
+}
+
+/// Save text to cache file
+fn save_text_to_cache(cache_path: &Path, text: &str) -> Result<(), Box<dyn std::error::Error>> {
+    // Create parent directory if it doesn't exist
+    if let Some(parent) = cache_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(cache_path, text)?;
+    Ok(())
 }

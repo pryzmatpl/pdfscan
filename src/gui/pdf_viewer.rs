@@ -70,8 +70,19 @@ impl PdfViewer {
             },
             Err(err) => {
                 eprintln!("Failed to initialize Pdfium: {}", err);
+                eprintln!("Note: PDF rendering will not be available. Text extraction and search will still work.");
+                eprintln!("To enable PDF rendering, install the required system libraries:");
+                eprintln!("  - On Arch Linux: sudo pacman -S icu");
+                eprintln!("  - On Ubuntu/Debian: sudo apt-get install libicu-dev");
                 None
             }
+        };
+
+        // Default to TextOnly mode if Pdfium is not available
+        let view_mode = if pdfium.is_some() {
+            ViewMode::Rendered
+        } else {
+            ViewMode::TextOnly
         };
 
         Self {
@@ -91,7 +102,7 @@ impl PdfViewer {
             document_loaded: Arc::new(Mutex::new(None)),
             // Initialize new fields
             show_text_panel: false,
-            view_mode: ViewMode::Rendered,
+            view_mode,
         }
     }
     
@@ -144,66 +155,97 @@ impl PdfViewer {
     /// Process loaded document (should be called from the UI thread)
     fn process_loaded_document(&mut self, ctx: &Context) {
         if self.loading {
-            // Check if document has been loaded by the background thread
+            // Try to load with Pdfium first (primary method)
+            if let Some(path) = &self.current_pdf_path {
+                // Check if we already have a pdfium document
+                if self.pdfium_document.is_none() {
+                    // Load PDF with Pdfium and extract all needed data immediately
+                    let (total_pages, document_title, pdfium_doc) = {
+                        if let Some(pdfium) = &mut self.pdfium {
+                            match pdfium.load_pdf_from_file(path, None) {
+                                Ok(doc) => {
+                                    let pages = doc.pages().len() as usize;
+                                    let title = doc.metadata()
+                                        .get(Title)
+                                        .map(|t| t.value().to_string())
+                                        .unwrap_or_else(|| {
+                                            path.file_name()
+                                                .unwrap_or_default()
+                                                .to_string_lossy()
+                                                .to_string()
+                                        });
+                                    // Convert to 'static lifetime immediately
+                                    let static_doc: PdfDocument<'static> = unsafe {
+                                        std::mem::transmute(doc)
+                                    };
+                                    (Some(pages), Some(title), Some(static_doc))
+                                },
+                                Err(e) => {
+                                    eprintln!("Error loading PDF with Pdfium: {:?}", e);
+                                    (None, None, None)
+                                }
+                            }
+                        } else {
+                            eprintln!("Pdfium library not initialized - PDF viewing will not work");
+                            (None, None, None)
+                        }
+                    };
+                    
+                    // Now we can mutate self freely
+                    if let (Some(pages), Some(title), Some(doc)) = (total_pages, document_title, pdfium_doc) {
+                        self.total_pages = pages;
+                        self.document_title = title;
+                        self.pdfium_document = Some(Arc::new(PdfDocumentWrapper { document: doc }));
+
+                        // Render first page
+                        self.render_page(0, ctx);
+                        
+                        // Load first page text
+                        self.extract_page_text(0);
+                        
+                        // Document loading complete
+                        self.loading = false;
+                        return;
+                    }
+                }
+            }
+            
+            // Check if document has been loaded by the background thread (lopdf, for text extraction)
             let doc_option = {
                 let mut document_loaded = self.document_loaded.lock().unwrap();
                 document_loaded.take()
             };
 
             if let Some(doc) = doc_option {
-                // Update state with the loaded document
+                // Update state with the loaded document (for text extraction)
                 self.document = Some(doc.clone());
-                let mut needs_render = false;
-
-                // Try to load the document with Pdfium for rendering
-                if let Some(path) = &self.current_pdf_path {
-                    if let Some(pdfium) = &mut self.pdfium {
-                        // Store the result separately to avoid the borrow issue
-                        let pdfium_result = pdfium.load_pdf_from_file(path, None);
-
-                        match pdfium_result {
-                            Ok(pdfium_doc) => {
-                                // Get the number of pages
-                                self.total_pages = pdfium_doc.pages().len() as usize;
-
-                                // Try to extract title from document information
-                                let metadata = pdfium_doc.metadata();
-                                if let Some(title) = metadata.get(Title) {
-                                    self.document_title = title.value().to_string();
-                                }
-
-                                // Store document for rendering
-                                // We need to use a nasty trick to convert lifetimes
-                                let document: PdfDocument<'static> = unsafe {
-                                    std::mem::transmute(pdfium_doc)
-                                };
-                                self.pdfium_document = Some(Arc::new(PdfDocumentWrapper { document }));
-
-                                // Now call render_page
-                                needs_render = true;
-                            },
-                            Err(e) => {
-                                eprintln!("Error loading PDF with Pdfium: {:?}", e);
-                                // Fallback to lopdf for page count
-                                if let Some(doc) = &self.document {
-                                    self.total_pages = doc.get_pages().len();
-                                }
-                            }
-                        }
-                    } else {
-                        eprintln!("Pdfium library not initialized");
-                    }
-
-                    if needs_render {
-                        self.render_page(0, ctx);
-                    }
+                
+                // If Pdfium failed, use lopdf for page count as fallback
+                if self.total_pages == 0 {
+                    self.total_pages = doc.get_pages().len();
                 }
-
+                
                 // Load first page text
                 self.extract_page_text(0);
-
-                // Document loading complete
-                self.loading = false;
+            }
+            
+            // If we got here and still loading, check if we have at least text data
+            if self.loading {
+                let has_text = {
+                    let text_data = self.text_data.lock().unwrap();
+                    !text_data.is_empty()
+                };
+                
+                // If we have text but no PDF rendering, we can still show text mode
+                if has_text && self.total_pages == 0 {
+                    // Estimate pages from text length (rough estimate)
+                    self.total_pages = 1;
+                }
+                
+                // Mark as not loading if we have some data
+                if self.total_pages > 0 || has_text {
+                    self.loading = false;
+                }
             }
         }
     }
@@ -649,10 +691,16 @@ impl PdfViewer {
                         
                         // View mode options
                         ui.label("View:");
-                        if ui.radio(self.view_mode == ViewMode::Rendered, "Rendered").clicked() {
-                            self.view_mode = ViewMode::Rendered;
-                            // Ensure the current page is rendered
-                            self.render_page(self.current_page, ctx);
+                        if self.pdfium.is_some() {
+                            if ui.radio(self.view_mode == ViewMode::Rendered, "Rendered").clicked() {
+                                self.view_mode = ViewMode::Rendered;
+                                // Ensure the current page is rendered
+                                self.render_page(self.current_page, ctx);
+                            }
+                        } else {
+                            // Show disabled rendered option with explanation
+                            ui.radio(self.view_mode == ViewMode::Rendered, "Rendered (Pdfium not available)");
+                            ui.label(egui::RichText::new("Install libicu to enable PDF rendering").small().weak());
                         }
                         if ui.radio(self.view_mode == ViewMode::TextOnly, "Text Only").clicked() {
                             self.view_mode = ViewMode::TextOnly;
@@ -665,7 +713,8 @@ impl PdfViewer {
                 });
             
             // Main content area for the PDF
-            if self.document.is_some() || self.pdfium_document.is_some() {
+            // Show content if we have either a document (lopdf) or pdfium document, or if we're loading
+            if self.document.is_some() || self.pdfium_document.is_some() || self.loading {
                 match self.view_mode {
                     ViewMode::Rendered => {
                         if self.show_text_panel {
@@ -873,6 +922,17 @@ impl PdfViewer {
                     ui.heading("Welcome to PDFScan");
                     ui.add_space(20.0);
                     ui.label("To get started, open a PDF document.");
+                    
+                    // Show warning if Pdfium is not available
+                    if self.pdfium.is_none() {
+                        ui.add_space(10.0);
+                        ui.label(egui::RichText::new("⚠ PDF Rendering Unavailable").color(Color32::YELLOW).strong());
+                        ui.label(egui::RichText::new("Pdfium library could not be loaded. PDF rendering is disabled.").small());
+                        ui.label(egui::RichText::new("Text extraction and search will still work.").small());
+                        ui.add_space(5.0);
+                        ui.label(egui::RichText::new("To enable rendering, install: libicu (icu package on Arch)").small().weak());
+                    }
+                    
                     ui.add_space(20.0);
                     if ui.button("📂 Open PDF...").clicked() {
                         if let Some(path) = Self::open_file_dialog() {
